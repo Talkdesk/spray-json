@@ -18,20 +18,25 @@ package spray.json
 
 import scala.annotation.{switch, tailrec}
 import java.lang.{StringBuilder => JStringBuilder}
-import java.nio.{CharBuffer, ByteBuffer}
+import java.nio.{ByteBuffer, CharBuffer}
 import java.nio.charset.Charset
+
+import scala.collection.immutable.TreeMap
 
 /**
  * Fast, no-dependency parser for JSON as defined by http://tools.ietf.org/html/rfc4627.
  */
 object JsonParser {
   def apply(input: ParserInput): JsValue = new JsonParser(input).parseJsValue()
+  def apply(input: ParserInput, settings: JsonParserSettings): JsValue = new JsonParser(input, settings).parseJsValue()
 
   class ParsingException(val summary: String, val detail: String = "")
     extends RuntimeException(if (summary.isEmpty) detail else if (detail.isEmpty) summary else summary + ":" + detail)
 }
 
-class JsonParser(input: ParserInput) {
+class JsonParser(input: ParserInput, settings: JsonParserSettings = JsonParserSettings.default) {
+  def this(input: ParserInput) = this(input, JsonParserSettings.default)
+
   import JsonParser.ParsingException
 
   private[this] val sb = new JStringBuilder
@@ -43,7 +48,7 @@ class JsonParser(input: ParserInput) {
 
   def parseJsValue(allowTrailingInput: Boolean): JsValue = {
     ws()
-    `value`()
+    `value`(settings.maxDepth)
     if (!allowTrailingInput)
       require(EOI)
     jsValue
@@ -54,27 +59,33 @@ class JsonParser(input: ParserInput) {
   private final val EOI = '\uFFFF' // compile-time constant
 
   // http://tools.ietf.org/html/rfc4627#section-2.1
-  private def `value`(): Unit = {
-    val mark = input.cursor
-    def simpleValue(matched: Boolean, value: JsValue) = if (matched) jsValue = value else fail("JSON Value", mark)
-    (cursorChar: @switch) match {
-      case 'f' => simpleValue(`false`(), JsFalse)
-      case 'n' => simpleValue(`null`(), JsNull)
-      case 't' => simpleValue(`true`(), JsTrue)
-      case '{' => advance(); `object`()
-      case '[' => advance(); `array`()
-      case '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' | '-' => `number`()
-      case '"' => `string`(); jsValue = if (sb.length == 0) JsString.empty else JsString(sb.toString)
-      case _ => fail("JSON Value")
+  private def `value`(remainingNesting: Int): Unit =
+    if (remainingNesting == 0)
+      throw new ParsingException(
+        "JSON input nested too deeply",
+        s"JSON input was nested more deeply than the configured limit of maxNesting = ${settings.maxDepth}"
+      )
+    else {
+      val mark = input.cursor
+      def simpleValue(matched: Boolean, value: JsValue) = if (matched) jsValue = value else fail("JSON Value", mark)
+      (cursorChar: @switch) match {
+        case 'f' => simpleValue(`false`(), JsFalse)
+        case 'n' => simpleValue(`null`(), JsNull)
+        case 't' => simpleValue(`true`(), JsTrue)
+        case '{' => advance(); `object`(remainingNesting)
+        case '[' => advance(); `array`(remainingNesting)
+        case '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' | '-' => `number`()
+        case '"' => `string`(); jsValue = if (sb.length == 0) JsString.empty else JsString(sb.toString)
+        case _ => fail("JSON Value")
+      }
     }
-  }
 
   private def `false`() = advance() && ch('a') && ch('l') && ch('s') && ws('e')
   private def `null`() = advance() && ch('u') && ch('l') && ws('l')
   private def `true`() = advance() && ch('r') && ch('u') && ws('e')
 
   // http://tools.ietf.org/html/rfc4627#section-2.2
-  private def `object`(): Unit = {
+  private def `object`(remainingNesting: Int): Unit = {
     ws()
     jsValue = if (cursorChar != '}') {
       @tailrec def members(map: Map[String, JsValue]): Map[String, JsValue] = {
@@ -82,12 +93,11 @@ class JsonParser(input: ParserInput) {
         require(':')
         ws()
         val key = sb.toString
-        `value`()
+        `value`(remainingNesting - 1)
         val nextMap = map.updated(key, jsValue)
         if (ws(',')) members(nextMap) else nextMap
       }
-      var map = Map.empty[String, JsValue]
-      map = members(map)
+      val map = members(TreeMap.empty[String, JsValue])
       require('}')
       JsObject(map)
     } else {
@@ -98,12 +108,12 @@ class JsonParser(input: ParserInput) {
   }
 
   // http://tools.ietf.org/html/rfc4627#section-2.3
-  private def `array`(): Unit = {
+  private def `array`(remainingNesting: Int): Unit = {
     ws()
     jsValue = if (cursorChar != ']') {
       val list = Vector.newBuilder[JsValue]
       @tailrec def values(): Unit = {
-        `value`()
+        `value`(remainingNesting - 1)
         list += jsValue
         if (ws(',')) values()
       }
@@ -125,9 +135,19 @@ class JsonParser(input: ParserInput) {
     `int`()
     `frac`()
     `exp`()
+    val numberLength = input.cursor - start
+
     jsValue =
       if (startChar == '0' && input.cursor - start == 1) JsNumber.zero
-      else JsNumber(input.sliceCharArray(start, input.cursor))
+      else if (numberLength <= settings.maxNumberCharacters) JsNumber(input.sliceCharArray(start, input.cursor))
+      else {
+        val numberSnippet = new String(input.sliceCharArray(start, math.min(input.cursor, start + 20)))
+        throw new ParsingException("Number too long",
+          s"The number starting with '$numberSnippet' had " +
+          s"$numberLength characters which is more than the allowed limit maxNumberCharacters = ${settings.maxNumberCharacters}. If this is legit input " +
+          s"consider increasing the limit."
+        )
+      }
     ws()
   }
 

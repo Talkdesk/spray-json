@@ -26,7 +26,7 @@ Latest release: [![Maven Central](https://maven-badges.herokuapp.com/maven-centr
 If you use SBT you can include _spray-json_ in your project with
 
 ```scala
-libraryDependencies += "io.spray" %%  "spray-json" % "1.3.4"
+libraryDependencies += "io.spray" %%  "spray-json" % "1.3.5"
 ```
 
 ### Usage
@@ -41,26 +41,26 @@ import DefaultJsonProtocol._ // if you don't supply your own Protocol (see below
 
 and do one or more of the following:
 
-* Parse a JSON string into its Abstract Syntax Tree (AST) representation
+1. Parse a JSON string into its Abstract Syntax Tree (AST) representation
     
     ```scala
     val source = """{ "some": "JSON source" }"""
     val jsonAst = source.parseJson // or JsonParser(source)
     ```
     
-* Print a JSON AST back to a String using either the `CompactPrinter` or the `PrettyPrinter`
+2. Print a JSON AST back to a String using either the `CompactPrinter` or the `PrettyPrinter`
     
     ```scala
     val json = jsonAst.prettyPrint // or .compactPrint
     ```
     
-* Convert any Scala object to a JSON AST using the `toJson` extension method
+3. Convert any Scala object to a JSON AST using the `toJson` extension method
     
     ```scala
     val jsonAst = List(1, 2, 3).toJson
     ```
     
-* Convert a JSON AST to a Scala object with the `convertTo` method
+4. Convert a JSON AST to a Scala object with the `convertTo` method
     
     ```scala
     val myObject = jsonAst.convertTo[MyObjectType]
@@ -69,7 +69,6 @@ and do one or more of the following:
 In order to make steps 3 and 4 work for an object of type `T` you need to bring implicit values in scope that
 provide `JsonFormat[T]` instances for `T` and all types used by `T` (directly or indirectly).
 The way you normally do this is via a "JsonProtocol".
-
 
 ### JsonProtocol
 
@@ -292,6 +291,21 @@ wrapper). Note, that `lazyFormat` returns a `JsonFormat` even if it was given a 
 picked up by `SprayJsonSupport`. To get back a `RootJsonFormat` just wrap the complete `lazyFormat` call with another
 call to `rootFormat`.
 
+
+### Customizing Parser Settings
+
+The parser can be customized by providing a custom instance of `JsonParserSettings` to `JsonParser.apply` or
+`String.parseJson`:
+
+```scala
+val customSettings =
+  JsonParserSettings.default
+     .withMaxDepth(100)
+     .withMaxNumberCharacters(20)
+val jsValue = JsonParser(jsonString, customSettings)
+// or
+val jsValue = jsonString.parseJson(customSettings)
+```
 
 ### Credits
 

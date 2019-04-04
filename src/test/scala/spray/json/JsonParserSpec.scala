@@ -18,6 +18,8 @@ package spray.json
 
 import org.specs2.mutable._
 
+import scala.util.control.NonFatal
+
 class JsonParserSpec extends Specification {
 
   "The JsonParser" should {
@@ -73,16 +75,51 @@ class JsonParserSpec extends Specification {
       JsonParser(json.prettyPrint.getBytes("UTF-8")) === json
     }
     "be reentrant" in {
+      import scala.concurrent.{Await, Future}
+      import scala.concurrent.duration._
+      import scala.concurrent.ExecutionContext.Implicits.global
+
       val largeJsonSource = scala.io.Source.fromInputStream(getClass.getResourceAsStream("/test.json")).mkString
-      import scala.collection.parallel.immutable.ParSeq
-      ParSeq.fill(20)(largeJsonSource).map(JsonParser(_)).toList.map {
-          _.asInstanceOf[JsObject].fields("questions").asInstanceOf[JsArray].elements.size
-      } === List.fill(20)(100)
+      val list = Await.result(
+        Future.traverse(List.fill(20)(largeJsonSource))(src => Future(JsonParser(src))),
+        5.seconds
+      )
+      list.map(_.asInstanceOf[JsObject].fields("questions").asInstanceOf[JsArray].elements.size) === List.fill(20)(100)
+    }
+    "not show bad performance characteristics when object keys' hashCodes collide" in {
+      val numKeys = 10000
+      val value = "null"
+
+      val regularKeys = Iterator.from(1).map(i => s"key_$i").take(numKeys)
+      val collidingKeys = HashCodeCollider.zeroHashCodeIterator().take(numKeys)
+
+      def createJson(keys: Iterator[String]): String = keys.mkString("""{"""", s"""":$value,"""", s"""":$value}""")
+
+      def nanoBench(block: => Unit): Long = {
+        // great microbenchmark (the comment must be kept, otherwise it's not true)
+        val f = block _
+
+        // warmup
+        (1 to 10).foreach(_ => f())
+
+        val start = System.nanoTime()
+        f()
+        val end = System.nanoTime()
+        end - start
+      }
+
+      val regularJson = createJson(regularKeys)
+      val collidingJson = createJson(collidingKeys)
+
+      val regularTime = nanoBench { JsonParser(regularJson) }
+      val collidingTime = nanoBench { JsonParser(collidingJson) }
+
+      collidingTime / regularTime must be < 2L // speed must be in same order of magnitude
     }
 
     "produce proper error messages" in {
-      def errorMessage(input: String) =
-        try JsonParser(input) catch { case e: JsonParser.ParsingException => e.getMessage }
+      def errorMessage(input: String, settings: JsonParserSettings = JsonParserSettings.default) =
+        try JsonParser(input, settings) catch { case e: JsonParser.ParsingException => e.getMessage }
 
       errorMessage("""[null, 1.23 {"key":true } ]""") ===
         """Unexpected character '{' at input index 12 (line 1, position 13), expected ']':
@@ -107,6 +144,37 @@ class JsonParserSpec extends Specification {
           |{}x
           |  ^
           |""".stripMargin
+
+      "reject numbers which are too big / have too high precision" in {
+        val settings = JsonParserSettings.default.withMaxNumberCharacters(5)
+        errorMessage("123.4567890", settings) ===
+          "Number too long:The number starting with '123.4567890' had 11 characters which is more than the allowed limit " +
+          "maxNumberCharacters = 5. If this is legit input consider increasing the limit."
+      }
+    }
+
+    "fail gracefully for deeply nested structures" in {
+      val queue = new java.util.ArrayDeque[String]()
+
+      // testing revealed that each recursion will need approx. 280 bytes of stack space
+      val depth = 1500
+      val runnable = new Runnable {
+        override def run(): Unit =
+          try {
+            val nested = "[{\"key\":" * (depth / 2)
+            JsonParser(nested)
+            queue.push("didn't fail")
+          } catch {
+            case s: StackOverflowError => queue.push("stackoverflow")
+            case NonFatal(e) =>
+              queue.push(s"nonfatal: ${e.getMessage}")
+          }
+      }
+
+      val thread = new Thread(null, runnable, "parser-test", 655360)
+      thread.start()
+      thread.join()
+      queue.peek() === "nonfatal: JSON input nested too deeply:JSON input was nested more deeply than the configured limit of maxNesting = 1000"
     }
 
     "parse multiple values when allowTrailingInput" in {
